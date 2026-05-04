@@ -1,0 +1,199 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  PARENT
+  DOCTOR
+  ADMIN
+}
+
+enum ConsultationStatus {
+  AI_MANAGED    // Fully handled by the AI guidance engine
+  ESCALATING    // Transition in progress; doctor assignment pending
+  DOCTOR_MANAGED // Doctor has accepted and taken ownership
+  CLOSED        // Resolved / archived
+}
+
+enum EscalationTrigger {
+  USER_REQUESTED      // Parent explicitly asked for a doctor
+  AI_THRESHOLD_MET    // Proprietary model flagged clinical criteria
+  ADMIN_OVERRIDE      // Admin manually escalated
+}
+
+enum HealthCondition {
+  CHRONIC_CONSTIPATION
+  THYROID
+  B12_DEFICIENCY
+  LIVER_DISEASE
+  OTHER
+}
+
+// ─── User ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id              String   @id @default(cuid())
+  email           String   @unique
+  passwordHash    String
+  firstName       String
+  lastName        String
+  role            Role     @default(PARENT)
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // PARENT relations
+  children        Child[]
+  parentConsultations Consultation[] @relation("ParentConsultations")
+
+  // DOCTOR relations
+  doctorProfile   DoctorProfile?
+  assignedConsultations Consultation[] @relation("DoctorConsultations")
+  healthRecordNotes HealthRecord[]
+
+  @@index([email])
+  @@index([role])
+}
+
+// ─── DoctorProfile ────────────────────────────────────────────────────────────
+// Extends User for doctor-specific attributes (region, specialisation, etc.)
+
+model DoctorProfile {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  licenseNumber   String   @unique
+  specialisation  String?
+  region          String   // Used for regional routing during escalation
+  isAcceptingCases Boolean @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([region])
+}
+
+// ─── Child ────────────────────────────────────────────────────────────────────
+
+model Child {
+  id              String   @id @default(cuid())
+  parentId        String
+  parent          User     @relation(fields: [parentId], references: [id], onDelete: Cascade)
+  firstName       String
+  dateOfBirth     DateTime
+  gender          String   // "male" | "female" | "other"
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  growthMetrics   GrowthMetric[]
+  consultations   Consultation[]
+  healthRecords   HealthRecord[]
+
+  @@index([parentId])
+}
+
+// ─── GrowthMetric ─────────────────────────────────────────────────────────────
+
+model GrowthMetric {
+  id              String   @id @default(cuid())
+  childId         String
+  child           Child    @relation(fields: [childId], references: [id], onDelete: Cascade)
+  recordedAt      DateTime @default(now())
+  ageMonths       Int      // Age in months at time of measurement
+  heightCm        Float
+  weightKg        Float
+
+  // Percentile results cached from the calculation service
+  heightPercentile Float?
+  weightPercentile Float?
+  bmiPercentile    Float?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([childId, recordedAt])
+}
+
+// ─── Consultation ─────────────────────────────────────────────────────────────
+// Central state machine record. Tracks a child's care episode from AI → Doctor.
+
+model Consultation {
+  id              String              @id @default(cuid())
+  childId         String
+  child           Child               @relation(fields: [childId], references: [id])
+  parentId        String
+  parent          User                @relation("ParentConsultations", fields: [parentId], references: [id])
+  doctorId        String?
+  doctor          User?               @relation("DoctorConsultations", fields: [doctorId], references: [id])
+
+  status          ConsultationStatus  @default(AI_MANAGED)
+  escalationTrigger EscalationTrigger?
+  escalatedAt     DateTime?           // Timestamp of the AI → Doctor transition
+  doctorAcceptedAt DateTime?
+  closedAt        DateTime?
+
+  // Last AI guidance snapshot stored for doctor context
+  lastAiGuidanceSnapshot Json?
+
+  notes           ConsultationNote[]
+  healthRecords   HealthRecord[]
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([childId])
+  @@index([parentId])
+  @@index([doctorId])
+  @@index([status])
+}
+
+// ─── ConsultationNote ─────────────────────────────────────────────────────────
+
+model ConsultationNote {
+  id              String       @id @default(cuid())
+  consultationId  String
+  consultation    Consultation @relation(fields: [consultationId], references: [id], onDelete: Cascade)
+  authorId        String       // User who wrote the note (doctor or admin)
+  content         String       @db.Text
+  isVisibleToParent Boolean    @default(false)
+  createdAt       DateTime     @default(now())
+
+  @@index([consultationId])
+}
+
+// ─── HealthRecord ─────────────────────────────────────────────────────────────
+// Clinical records authored by doctors.
+// isVisibleToParent is the RBAC gate: doctors decide what parents can see.
+
+model HealthRecord {
+  id                String          @id @default(cuid())
+  childId           String
+  child             Child           @relation(fields: [childId], references: [id])
+  consultationId    String?
+  consultation      Consultation?   @relation(fields: [consultationId], references: [id])
+  authorId          String          // Must be a DOCTOR or ADMIN
+  author            User            @relation(fields: [authorId], references: [id])
+
+  condition         HealthCondition
+  conditionDetail   String?         // Free-text elaboration (e.g. "Hashimoto's")
+  notes             String?         @db.Text
+  diagnosedAt       DateTime?
+
+  // *** Core RBAC gate ***
+  // When false, this record is invisible to the parent in all API responses.
+  // Only the authoring doctor or an ADMIN may flip this flag.
+  isVisibleToParent Boolean         @default(false)
+
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  @@index([childId])
+  @@index([consultationId])
+  @@index([isVisibleToParent])
+}
