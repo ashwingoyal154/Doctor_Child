@@ -4,6 +4,7 @@ dotenv.config();
 
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
+import authRouter from "./routes/auth";
 import metricsRouter from "./routes/metrics";
 import aiGuidanceRouter from "./routes/aiGuidance";
 import consultationsRouter from "./routes/consultations";
@@ -14,6 +15,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+app.use("/api/auth", authRouter);
 app.use("/api/metrics", metricsRouter);
 app.use("/api/ai-guidance", aiGuidanceRouter);
 app.use("/api/consultations", consultationsRouter);
